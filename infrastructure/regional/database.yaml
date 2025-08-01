@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RDS Database Infrastructure for E-commerce Application'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  Region:
+    Type: String
+    Description: AWS Region for deployment
+  
+  ProjectName:
+    Type: String
+    Default: ecommerce
+    Description: Project name for resource naming
+  
+  VPCStackName:
+    Type: String
+    Description: Name of the VPC CloudFormation stack
+  
+  DatabaseName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: !Sub '/ecommerce/${AWS::Region}/database/name'
+    Description: Database name
+  
+  DatabaseUsername:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: !Sub '/ecommerce/${AWS::Region}/database/username'
+    Description: Database master username
+  
+  DatabasePassword:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: !Sub '/ecommerce/${AWS::Region}/database/password'
+    NoEcho: true
+    Description: Database master password
+
+Resources:
+  # DB Subnet Group
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-${Environment}-db-subnet-group-${Region}'
+      DBSubnetGroupDescription: Subnet group for RDS database
+      SubnetIds:
+        - Fn::Select:
+          - 0
+          - Fn::Split:
+            - ','
+            - Fn::ImportValue: !Sub '${VPCStackName}-DatabaseSubnets'
+        - Fn::Select:
+          - 1
+          - Fn::Split:
+            - ','
+            - Fn::ImportValue: !Sub '${VPCStackName}-DatabaseSubnets'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-db-subnet-group-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # DB Parameter Group
+  DatabaseParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub '${ProjectName}-${Environment}-db-params-${Region}'
+      Description: Parameter group for MySQL database
+      Family: mysql8.0
+      Parameters:
+        innodb_buffer_pool_size: '{DBInstanceClassMemory*3/4}'
+        max_connections: 1000
+        slow_query_log: 1
+        long_query_time: 2
+        general_log: 0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-db-params-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # RDS Instance
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-${Environment}-db-${Region}'
+      DBName: !Ref DatabaseName
+      DBInstanceClass: !If
+        - IsProduction
+        - db.r5.xlarge
+        - db.t3.medium
+      Engine: mysql
+      EngineVersion: '8.0.35'
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      AllocatedStorage: !If
+        - IsProduction
+        - 100
+        - 20
+      MaxAllocatedStorage: !If
+        - IsProduction
+        - 1000
+        - 100
+      StorageType: gp2
+      StorageEncrypted: true
+      VPCSecurityGroups:
+        - Fn::ImportValue: !Sub '${VPCStackName}-DatabaseSecurityGroup'
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      DBParameterGroupName: !Ref DatabaseParameterGroup
+      BackupRetentionPeriod: !If
+        - IsProduction
+        - 30
+        - 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      MultiAZ: !If
+        - IsProduction
+        - true
+        - false
+      PubliclyAccessible: false
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt DatabaseMonitoringRole.Arn
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: !If
+        - IsProduction
+        - 731
+        - 7
+      DeletionProtection: !If
+        - IsProduction
+        - true
+        - false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-db-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Read Replica (Production only)
+  DatabaseReadReplica:
+    Type: AWS::RDS::DBInstance
+    Condition: IsProduction
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-${Environment}-db-replica-${Region}'
+      SourceDBInstanceIdentifier: !Ref DatabaseInstance
+      DBInstanceClass: db.r5.large
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-db-replica-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Database Monitoring Role
+  DatabaseMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-db-monitoring-role-${Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  # CloudWatch Alarms
+  DatabaseCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-db-cpu-${Region}'
+      AlarmDescription: Database CPU utilization is too high
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      AlarmActions:
+        - !Ref DatabaseAlarmTopic
+
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-db-connections-${Region}'
+      AlarmDescription: Database connection count is too high
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DatabaseInstance
+      AlarmActions:
+        - !Ref DatabaseAlarmTopic
+
+  # SNS Topic for Database Alarms
+  DatabaseAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-db-alarms-${Region}'
+      DisplayName: Database Alarms
+      Subscription:
+        - Protocol: email
+          Endpoint: !Sub '{{resolve:ssm:/ecommerce/${Region}/alerts/email}}'
+
+  # Store Database Endpoint in SSM
+  DatabaseEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/ecommerce/${Region}/database/host'
+      Type: String
+      Value: !GetAtt DatabaseInstance.Endpoint.Address
+      Description: Database endpoint address
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, prod]
+
+Outputs:
+  DatabaseInstance:
+    Description: RDS Database Instance ID
+    Value: !Ref DatabaseInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseInstance'
+
+  DatabaseEndpoint:
+    Description: RDS Database Endpoint
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpoint'
+
+  DatabasePort:
+    Description: RDS Database Port
+    Value: !GetAtt DatabaseInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePort'
+
+  DatabaseReadReplica:
+    Condition: IsProduction
+    Description: RDS Read Replica Instance ID
+    Value: !Ref DatabaseReadReplica
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseReadReplica'

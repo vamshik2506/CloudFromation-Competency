@@ -1,0 +1,402 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Infrastructure for E-commerce Application'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  Region:
+    Type: String
+    Description: AWS Region for deployment
+  
+  ProjectName:
+    Type: String
+    Default: ecommerce
+    Description: Project name for resource naming
+  
+  VPCStackName:
+    Type: String
+    Description: Name of the VPC CloudFormation stack
+  
+  ECRRepositoryURI:
+    Type: String
+    Description: ECR repository URI for container images
+
+Resources:
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}-cluster-${Region}'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 4
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-cluster-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-alb-${Region}'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - Fn::Select:
+          - 0
+          - Fn::Split:
+            - ','
+            - Fn::ImportValue: !Sub '${VPCStackName}-PublicSubnets'
+        - Fn::Select:
+          - 1
+          - Fn::Split:
+            - ','
+            - Fn::ImportValue: !Sub '${VPCStackName}-PublicSubnets'
+      SecurityGroups:
+        - Fn::ImportValue: !Sub '${VPCStackName}-ALBSecurityGroup'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alb-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Target Groups
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-frontend-tg-${Region}'
+      Port: 3000
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStackName}-VPC'
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-frontend-tg-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-backend-tg-${Region}'
+      Port: 3001
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub '${VPCStackName}-VPC'
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-backend-tg-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ALB Listeners
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # ALB Listener Rules
+  BackendListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/api/*'
+            - '/health'
+      ListenerArn: !Ref ALBListener
+      Priority: 100
+
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-execution-role-${Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECSTaskExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ecommerce/*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:ecommerce/*'
+
+  # ECS Task Role
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-task-role-${Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ECSTaskPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:aws:s3:::${ProjectName}-${Environment}-invoices-${Region}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${ProjectName}-${Environment}-notifications-${Region}'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-invoice-generator-${Region}'
+
+  # CloudWatch Log Groups
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}-frontend-${Region}'
+      RetentionInDays: 30
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}-backend-${Region}'
+      RetentionInDays: 30
+
+  # ECS Task Definitions
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-frontend-${Region}'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 512
+      Memory: 1024
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Sub '${ECRRepositoryURI}/frontend-${Region}:latest'
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: REACT_APP_REGION
+              Value: !Ref Region
+            - Name: REACT_APP_API_URL
+              Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Essential: true
+
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-backend-${Region}'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 1024
+      Memory: 2048
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Sub '${ECRRepositoryURI}/backend-${Region}:latest'
+          PortMappings:
+            - ContainerPort: 3001
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: REGION
+              Value: !Ref Region
+            - Name: DB_HOST
+              Value: !Sub '{{resolve:ssm:/ecommerce/${Region}/database/host}}'
+            - Name: DB_NAME
+              Value: !Sub '{{resolve:ssm:/ecommerce/${Region}/database/name}}'
+            - Name: DB_USER
+              Value: !Sub '{{resolve:ssm:/ecommerce/${Region}/database/username}}'
+            - Name: DB_PASSWORD
+              Value: !Sub '{{resolve:ssm-secure:/ecommerce/${Region}/database/password}}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Essential: true
+
+  # ECS Services
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-frontend-${Region}'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - Fn::ImportValue: !Sub '${VPCStackName}-ECSSecurityGroup'
+          Subnets:
+            - Fn::Select:
+              - 0
+              - Fn::Split:
+                - ','
+                - Fn::ImportValue: !Sub '${VPCStackName}-PrivateSubnets'
+            - Fn::Select:
+              - 1
+              - Fn::Split:
+                - ','
+                - Fn::ImportValue: !Sub '${VPCStackName}-PrivateSubnets'
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: frontend
+          ContainerPort: 3000
+          TargetGroupArn: !Ref FrontendTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-frontend-service-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn: BackendListenerRule
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-backend-${Region}'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - Fn::ImportValue: !Sub '${VPCStackName}-ECSSecurityGroup'
+          Subnets:
+            - Fn::Select:
+              - 0
+              - Fn::Split:
+                - ','
+                - Fn::ImportValue: !Sub '${VPCStackName}-PrivateSubnets'
+            - Fn::Select:
+              - 1
+              - Fn::Split:
+                - ','
+                - Fn::ImportValue: !Sub '${VPCStackName}-PrivateSubnets'
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 3001
+          TargetGroupArn: !Ref BackendTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-backend-service-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  ECSCluster:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSCluster'
+
+  ApplicationLoadBalancer:
+    Description: Application Load Balancer ARN
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-ALB'
+
+  ApplicationLoadBalancerDNS:
+    Description: Application Load Balancer DNS Name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBDNS'
+
+  FrontendService:
+    Description: Frontend ECS Service Name
+    Value: !Ref FrontendService
+    Export:
+      Name: !Sub '${AWS::StackName}-FrontendService'
+
+  BackendService:
+    Description: Backend ECS Service Name
+    Value: !Ref BackendService
+    Export:
+      Name: !Sub '${AWS::StackName}-BackendService'

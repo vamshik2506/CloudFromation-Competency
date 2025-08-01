@@ -1,0 +1,238 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "Installing AWS CLI and dependencies..."
+      - pip install --upgrade pip
+      - pip install awscli boto3
+      - aws --version
+
+  pre_build:
+    commands:
+      - echo "Pre-build phase started on `date`"
+      - echo "Setting up environment variables..."
+      - export REGIONS=$(echo $DEPLOYMENT_REGIONS | tr ',' ' ')
+      - echo "Deployment regions: $REGIONS"
+      - echo "Dev Account: $DEV_ACCOUNT_ID"
+      - echo "Staging Account: $STAGING_ACCOUNT_ID"
+      - echo "Prod Account: $PROD_ACCOUNT_ID"
+
+  build:
+    commands:
+      - echo "Build phase started on `date`"
+      - echo "Deploying infrastructure using StackSets..."
+      
+      # Create StackSet Administration Role if it doesn't exist
+      - |
+        aws iam get-role --role-name AWSCloudFormationStackSetAdministrationRole 2>/dev/null || \
+        aws iam create-role \
+          --role-name AWSCloudFormationStackSetAdministrationRole \
+          --assume-role-policy-document file://infrastructure/shared/stackset-admin-role-trust-policy.json
+      
+      - |
+        aws iam attach-role-policy \
+          --role-name AWSCloudFormationStackSetAdministrationRole \
+          --policy-arn arn:aws:iam::aws:policy/service-role/AWSCloudFormationStackSetAdministrationRole 2>/dev/null || true
+
+      # Deploy VPC StackSet
+      - echo "Deploying VPC infrastructure..."
+      - |
+        aws cloudformation create-stack-set \
+          --stack-set-name ecommerce-vpc-stackset \
+          --template-body file://infrastructure/regional/vpc.yaml \
+          --capabilities CAPABILITY_NAMED_IAM \
+          --parameters \
+            ParameterKey=Environment,ParameterValue=prod \
+            ParameterKey=ProjectName,ParameterValue=ecommerce \
+          --administration-role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/AWSCloudFormationStackSetAdministrationRole \
+          --execution-role-name AWSCloudFormationStackSetExecutionRole \
+          --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+          2>/dev/null || \
+        aws cloudformation update-stack-set \
+          --stack-set-name ecommerce-vpc-stackset \
+          --template-body file://infrastructure/regional/vpc.yaml \
+          --capabilities CAPABILITY_NAMED_IAM \
+          --parameters \
+            ParameterKey=Environment,ParameterValue=prod \
+            ParameterKey=ProjectName,ParameterValue=ecommerce \
+          --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100
+
+      # Deploy VPC stack instances to all regions and accounts
+      - |
+        for region in $REGIONS; do
+          echo "Deploying VPC to region: $region"
+          
+          # Deploy to Dev Account
+          aws cloudformation create-stack-instances \
+            --stack-set-name ecommerce-vpc-stackset \
+            --accounts $DEV_ACCOUNT_ID \
+            --regions $region \
+            --parameter-overrides \
+              ParameterKey=Environment,ParameterValue=dev \
+              ParameterKey=Region,ParameterValue=$region \
+            --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+            2>/dev/null || true
+          
+          # Deploy to Staging Account
+          aws cloudformation create-stack-instances \
+            --stack-set-name ecommerce-vpc-stackset \
+            --accounts $STAGING_ACCOUNT_ID \
+            --regions $region \
+            --parameter-overrides \
+              ParameterKey=Environment,ParameterValue=staging \
+              ParameterKey=Region,ParameterValue=$region \
+            --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+            2>/dev/null || true
+          
+          # Deploy to Prod Account
+          aws cloudformation create-stack-instances \
+            --stack-set-name ecommerce-vpc-stackset \
+            --accounts $PROD_ACCOUNT_ID \
+            --regions $region \
+            --parameter-overrides \
+              ParameterKey=Environment,ParameterValue=prod \
+              ParameterKey=Region,ParameterValue=$region \
+            --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+            2>/dev/null || true
+        done
+
+      # Wait for VPC deployment to complete
+      - echo "Waiting for VPC deployment to complete..."
+      - sleep 300
+
+      # Deploy Database StackSet
+      - echo "Deploying Database infrastructure..."
+      - |
+        aws cloudformation create-stack-set \
+          --stack-set-name ecommerce-database-stackset \
+          --template-body file://infrastructure/regional/database.yaml \
+          --capabilities CAPABILITY_NAMED_IAM \
+          --parameters \
+            ParameterKey=Environment,ParameterValue=prod \
+            ParameterKey=ProjectName,ParameterValue=ecommerce \
+          --administration-role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/AWSCloudFormationStackSetAdministrationRole \
+          --execution-role-name AWSCloudFormationStackSetExecutionRole \
+          --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+          2>/dev/null || \
+        aws cloudformation update-stack-set \
+          --stack-set-name ecommerce-database-stackset \
+          --template-body file://infrastructure/regional/database.yaml \
+          --capabilities CAPABILITY_NAMED_IAM \
+          --parameters \
+            ParameterKey=Environment,ParameterValue=prod \
+            ParameterKey=ProjectName,ParameterValue=ecommerce \
+          --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100
+
+      # Deploy Database stack instances
+      - |
+        for region in $REGIONS; do
+          echo "Deploying Database to region: $region"
+          
+          aws cloudformation create-stack-instances \
+            --stack-set-name ecommerce-database-stackset \
+            --accounts $DEV_ACCOUNT_ID $STAGING_ACCOUNT_ID $PROD_ACCOUNT_ID \
+            --regions $region \
+            --parameter-overrides \
+              ParameterKey=Region,ParameterValue=$region \
+              ParameterKey=VPCStackName,ParameterValue=ecommerce-vpc-stackset-$region \
+            --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+            2>/dev/null || true
+        done
+
+      # Deploy Lambda StackSet
+      - echo "Deploying Lambda infrastructure..."
+      - |
+        aws cloudformation create-stack-set \
+          --stack-set-name ecommerce-lambda-stackset \
+          --template-body file://infrastructure/regional/lambda.yaml \
+          --capabilities CAPABILITY_NAMED_IAM \
+          --parameters \
+            ParameterKey=Environment,ParameterValue=prod \
+            ParameterKey=ProjectName,ParameterValue=ecommerce \
+          --administration-role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/AWSCloudFormationStackSetAdministrationRole \
+          --execution-role-name AWSCloudFormationStackSetExecutionRole \
+          --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+          2>/dev/null || \
+        aws cloudformation update-stack-set \
+          --stack-set-name ecommerce-lambda-stackset \
+          --template-body file://infrastructure/regional/lambda.yaml \
+          --capabilities CAPABILITY_NAMED_IAM \
+          --parameters \
+            ParameterKey=Environment,ParameterValue=prod \
+            ParameterKey=ProjectName,ParameterValue=ecommerce \
+          --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100
+
+      # Deploy Lambda stack instances
+      - |
+        for region in $REGIONS; do
+          echo "Deploying Lambda to region: $region"
+          
+          aws cloudformation create-stack-instances \
+            --stack-set-name ecommerce-lambda-stackset \
+            --accounts $DEV_ACCOUNT_ID $STAGING_ACCOUNT_ID $PROD_ACCOUNT_ID \
+            --regions $region \
+            --parameter-overrides \
+              ParameterKey=Region,ParameterValue=$region \
+              ParameterKey=VPCStackName,ParameterValue=ecommerce-vpc-stackset-$region \
+            --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+            2>/dev/null || true
+        done
+
+      # Deploy ECS StackSet
+      - echo "Deploying ECS infrastructure..."
+      - |
+        aws cloudformation create-stack-set \
+          --stack-set-name ecommerce-ecs-stackset \
+          --template-body file://infrastructure/regional/ecs.yaml \
+          --capabilities CAPABILITY_NAMED_IAM \
+          --parameters \
+            ParameterKey=Environment,ParameterValue=prod \
+            ParameterKey=ProjectName,ParameterValue=ecommerce \
+          --administration-role-arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/AWSCloudFormationStackSetAdministrationRole \
+          --execution-role-name AWSCloudFormationStackSetExecutionRole \
+          --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+          2>/dev/null || \
+        aws cloudformation update-stack-set \
+          --stack-set-name ecommerce-ecs-stackset \
+          --template-body file://infrastructure/regional/ecs.yaml \
+          --capabilities CAPABILITY_NAMED_IAM \
+          --parameters \
+            ParameterKey=Environment,ParameterValue=prod \
+            ParameterKey=ProjectName,ParameterValue=ecommerce \
+          --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100
+
+      # Deploy ECS stack instances
+      - |
+        for region in $REGIONS; do
+          echo "Deploying ECS to region: $region"
+          
+          aws cloudformation create-stack-instances \
+            --stack-set-name ecommerce-ecs-stackset \
+            --accounts $DEV_ACCOUNT_ID $STAGING_ACCOUNT_ID $PROD_ACCOUNT_ID \
+            --regions $region \
+            --parameter-overrides \
+              ParameterKey=Region,ParameterValue=$region \
+              ParameterKey=VPCStackName,ParameterValue=ecommerce-vpc-stackset-$region \
+              ParameterKey=ECRRepositoryURI,ParameterValue=${AWS_ACCOUNT_ID}.dkr.ecr.$region.amazonaws.com/ecommerce \
+            --operation-preferences RegionConcurrencyType=PARALLEL,MaxConcurrentPercentage=100 \
+            2>/dev/null || true
+        done
+
+      - echo "Infrastructure deployment completed successfully!"
+
+  post_build:
+    commands:
+      - echo "Post-build phase started on `date`"
+      - echo "Infrastructure deployment completed!"
+      - |
+        echo "Deployed infrastructure to the following regions:"
+        for region in $REGIONS; do
+          echo "  - $region"
+        done
+
+artifacts:
+  files:
+    - '**/*'

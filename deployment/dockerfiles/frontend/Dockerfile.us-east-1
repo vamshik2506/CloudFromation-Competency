@@ -1,0 +1,41 @@
+# Frontend Dockerfile for US East 1 Region
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+RUN npm ci --only=production
+
+# Copy source code
+COPY . .
+
+# Set region-specific environment variables
+ENV REACT_APP_REGION=us-east-1
+ENV REACT_APP_CURRENCY=USD
+ENV REACT_APP_TAX_RATE=0.085
+ENV REACT_APP_OFFERS="black_friday_15,free_shipping_75"
+ENV REACT_APP_API_URL=https://api-us-east-1.ecommerce.com
+
+# Build the application
+RUN npm run build
+
+# Production stage
+FROM nginx:alpine
+
+# Copy custom nginx config
+COPY deployment/nginx/nginx.conf /etc/nginx/nginx.conf
+
+# Copy built application
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Add region-specific configuration
+RUN echo '{"region":"us-east-1","currency":"USD","features":["black_friday","free_shipping"]}' > /usr/share/nginx/html/config.json
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost/ || exit 1
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]

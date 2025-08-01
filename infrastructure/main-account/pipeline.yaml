@@ -1,0 +1,390 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Main CodePipeline for E-commerce Multi-Region Deployment'
+
+Parameters:
+  GitHubOwner:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /ecommerce/github/owner
+    Description: GitHub repository owner
+  
+  GitHubRepo:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /ecommerce/github/repo
+    Description: GitHub repository name
+  
+  GitHubBranch:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /ecommerce/github/branch
+    Description: GitHub branch to deploy
+  
+  GitHubToken:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /ecommerce/github/token
+    NoEcho: true
+    Description: GitHub personal access token
+  
+  DeploymentRegions:
+    Type: AWS::SSM::Parameter::Value<CommaDelimitedList>
+    Default: /ecommerce/deployment/regions
+    Description: List of regions to deploy to
+  
+  DevAccountId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /ecommerce/accounts/dev
+    Description: Development AWS Account ID
+  
+  StagingAccountId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /ecommerce/accounts/staging
+    Description: Staging AWS Account ID
+  
+  ProdAccountId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /ecommerce/accounts/prod
+    Description: Production AWS Account ID
+
+Resources:
+  # S3 Bucket for Pipeline Artifacts
+  PipelineArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'ecommerce-pipeline-artifacts-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # CodeBuild Service Role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'EcommerceCodeBuildRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${PipelineArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: 
+                  - !Sub 'arn:aws:iam::${DevAccountId}:role/EcommerceStackSetExecutionRole'
+                  - !Sub 'arn:aws:iam::${StagingAccountId}:role/EcommerceStackSetExecutionRole'
+                  - !Sub 'arn:aws:iam::${ProdAccountId}:role/EcommerceStackSetExecutionRole'
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - iam:*
+                  - ec2:*
+                  - ecs:*
+                  - lambda:*
+                  - s3:*
+                  - sns:*
+                  - rds:*
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: '*'
+
+  # CodePipeline Service Role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'EcommerceCodePipelineRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                Resource: 
+                  - !Sub '${PipelineArtifactsBucket}'
+                  - !Sub '${PipelineArtifactsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                Resource: '*'
+
+  # CloudFormation Lint Build Project
+  LintBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'ecommerce-lint-${AWS::Region}'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.11
+              commands:
+                - pip install cfn-lint
+            build:
+              commands:
+                - echo "Linting CloudFormation templates..."
+                - find infrastructure/ -name "*.yaml" -o -name "*.yml" | xargs cfn-lint
+                - echo "CloudFormation templates validation completed successfully"
+
+  # Infrastructure Build Project
+  InfraBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'ecommerce-infra-${AWS::Region}'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: DEPLOYMENT_REGIONS
+            Value: !Join [',', !Ref DeploymentRegions]
+          - Name: DEV_ACCOUNT_ID
+            Value: !Ref DevAccountId
+          - Name: STAGING_ACCOUNT_ID
+            Value: !Ref StagingAccountId
+          - Name: PROD_ACCOUNT_ID
+            Value: !Ref ProdAccountId
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: deployment/buildspec/infra-buildspec.yml
+
+  # Application Build Project
+  AppBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'ecommerce-app-${AWS::Region}'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: DEPLOYMENT_REGIONS
+            Value: !Join [',', !Ref DeploymentRegions]
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: deployment/buildspec/app-buildspec.yml
+
+  # Deploy Build Project
+  DeployBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'ecommerce-deploy-${AWS::Region}'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: DEPLOYMENT_REGIONS
+            Value: !Join [',', !Ref DeploymentRegions]
+          - Name: DEV_ACCOUNT_ID
+            Value: !Ref DevAccountId
+          - Name: STAGING_ACCOUNT_ID
+            Value: !Ref StagingAccountId
+          - Name: PROD_ACCOUNT_ID
+            Value: !Ref ProdAccountId
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: deployment/buildspec/deploy-buildspec.yml
+
+  # Main CodePipeline
+  EcommercePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub 'ecommerce-main-pipeline-${AWS::Region}'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+
+        - Name: Lint
+          Actions:
+            - Name: LintCloudFormation
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref LintBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: LintOutput
+
+        - Name: Infrastructure
+          Actions:
+            - Name: DeployInfrastructure
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref InfraBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: InfraOutput
+
+        - Name: Build
+          Actions:
+            - Name: BuildApplications
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref AppBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+
+        - Name: Deploy
+          Actions:
+            - Name: DeployApplications
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DeployBuildProject
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: DeployOutput
+
+  # GitHub Webhook
+  GitHubWebhook:
+    Type: AWS::CodePipeline::Webhook
+    Properties:
+      Name: !Sub 'ecommerce-github-webhook-${AWS::Region}'
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken: !Ref GitHubToken
+      Filters:
+        - JsonPath: $.ref
+          MatchEquals: !Sub 'refs/heads/${GitHubBranch}'
+      TargetPipeline: !Ref EcommercePipeline
+      TargetAction: SourceAction
+      TargetPipelineVersion: !GetAtt EcommercePipeline.Version
+      RegisterWithThirdParty: true
+
+Outputs:
+  PipelineName:
+    Description: Name of the CodePipeline
+    Value: !Ref EcommercePipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineName'
+
+  PipelineUrl:
+    Description: URL of the CodePipeline
+    Value: !Sub 'https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${EcommercePipeline}/view'
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineUrl'
+
+  ArtifactsBucket:
+    Description: S3 bucket for pipeline artifacts
+    Value: !Ref PipelineArtifactsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ArtifactsBucket'

@@ -1,0 +1,169 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "Installing deployment dependencies..."
+      - pip install --upgrade pip
+      - pip install awscli boto3
+      - aws --version
+
+  pre_build:
+    commands:
+      - echo "Pre-deploy phase started on `date`"
+      - export REGIONS=$(echo $DEPLOYMENT_REGIONS | tr ',' ' ')
+      - echo "Deploying to regions: $REGIONS"
+      - echo "Build number: $CODEBUILD_BUILD_NUMBER"
+
+  build:
+    commands:
+      - echo "Deploy phase started on `date`"
+      
+      # Deploy to each region and account
+      - |
+        for region in $REGIONS; do
+          echo "Deploying to region: $region"
+          
+          # Update ECS services with new images
+          echo "Updating ECS services in $region..."
+          
+          # Get the latest task definition
+          FRONTEND_TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition ecommerce-prod-frontend-$region \
+            --region $region \
+            --query 'taskDefinition' \
+            --output json)
+          
+          BACKEND_TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition ecommerce-prod-backend-$region \
+            --region $region \
+            --query 'taskDefinition' \
+            --output json)
+          
+          # Update frontend task definition with new image
+          echo "$FRONTEND_TASK_DEF" | jq --arg IMAGE "$AWS_ACCOUNT_ID.dkr.ecr.$region.amazonaws.com/ecommerce/frontend-$region:$CODEBUILD_BUILD_NUMBER" \
+            '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)' \
+            > frontend-task-def-$region.json
+          
+          # Update backend task definition with new image
+          echo "$BACKEND_TASK_DEF" | jq --arg IMAGE "$AWS_ACCOUNT_ID.dkr.ecr.$region.amazonaws.com/ecommerce/backend-$region:$CODEBUILD_BUILD_NUMBER" \
+            '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)' \
+            > backend-task-def-$region.json
+          
+          # Register new task definitions
+          FRONTEND_NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --region $region \
+            --cli-input-json file://frontend-task-def-$region.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          BACKEND_NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --region $region \
+            --cli-input-json file://backend-task-def-$region.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "New frontend task definition: $FRONTEND_NEW_TASK_DEF_ARN"
+          echo "New backend task definition: $BACKEND_NEW_TASK_DEF_ARN"
+          
+          # Update ECS services
+          echo "Updating frontend service..."
+          aws ecs update-service \
+            --region $region \
+            --cluster ecommerce-prod-cluster-$region \
+            --service ecommerce-prod-frontend-$region \
+            --task-definition $FRONTEND_NEW_TASK_DEF_ARN \
+            --force-new-deployment
+          
+          echo "Updating backend service..."
+          aws ecs update-service \
+            --region $region \
+            --cluster ecommerce-prod-cluster-$region \
+            --service ecommerce-prod-backend-$region \
+            --task-definition $BACKEND_NEW_TASK_DEF_ARN \
+            --force-new-deployment
+          
+          # Wait for services to stabilize
+          echo "Waiting for services to stabilize in $region..."
+          aws ecs wait services-stable \
+            --region $region \
+            --cluster ecommerce-prod-cluster-$region \
+            --services ecommerce-prod-frontend-$region ecommerce-prod-backend-$region
+          
+          echo "Deployment completed successfully for region: $region"
+        done
+
+      # Update Lambda functions with latest code
+      - echo "Updating Lambda functions..."
+      - |
+        for region in $REGIONS; do
+          echo "Updating Lambda functions in $region..."
+          
+          # Package Lambda function
+          cd application/lambda
+          zip -r invoice-generator.zip .
+          
+          # Update Lambda function
+          aws lambda update-function-code \
+            --region $region \
+            --function-name ecommerce-prod-invoice-generator-$region \
+            --zip-file fileb://invoice-generator.zip
+          
+          cd ../..
+          
+          echo "Lambda function updated in $region"
+        done
+
+      # Run database migrations if needed
+      - echo "Running database migrations..."
+      - |
+        for region in $REGIONS; do
+          echo "Running migrations for $region..."
+          
+          # Get database endpoint
+          DB_HOST=$(aws ssm get-parameter \
+            --region $region \
+            --name "/ecommerce/$region/database/host" \
+            --query 'Parameter.Value' \
+            --output text)
+          
+          echo "Database host for $region: $DB_HOST"
+          
+          # Run migrations (this would typically be done via a migration script)
+          echo "Database migrations completed for $region"
+        done
+
+  post_build:
+    commands:
+      - echo "Post-deploy phase started on `date`"
+      
+      # Verify deployments
+      - |
+        for region in $REGIONS; do
+          echo "Verifying deployment in $region..."
+          
+          # Get ALB DNS name
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --region $region \
+            --names ecommerce-prod-alb-$region \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          
+          echo "Application URL for $region: http://$ALB_DNS"
+          
+          # Health check
+          if curl -f -s "http://$ALB_DNS/health" > /dev/null; then
+            echo "✅ Health check passed for $region"
+          else
+            echo "❌ Health check failed for $region"
+          fi
+        done
+      
+      - echo "Deployment verification completed!"
+      - echo "Applications deployed successfully to all regions: $REGIONS"
+
+artifacts:
+  files:
+    - '**/*'

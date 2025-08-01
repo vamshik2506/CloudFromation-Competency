@@ -1,0 +1,115 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+      docker: 20
+    commands:
+      - echo "Installing dependencies..."
+      - npm install -g npm@latest
+      - docker --version
+      - aws --version
+
+  pre_build:
+    commands:
+      - echo "Pre-build phase started on `date`"
+      - echo "Logging in to Amazon ECR..."
+      - export REGIONS=$(echo $DEPLOYMENT_REGIONS | tr ',' ' ')
+      - echo "Building for regions: $REGIONS"
+      
+      # Login to ECR for each region
+      - |
+        for region in $REGIONS; do
+          echo "Logging into ECR for region: $region"
+          aws ecr get-login-password --region $region | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$region.amazonaws.com
+          
+          # Create ECR repositories if they don't exist
+          aws ecr describe-repositories --repository-names ecommerce/frontend-$region --region $region 2>/dev/null || \
+          aws ecr create-repository --repository-name ecommerce/frontend-$region --region $region
+          
+          aws ecr describe-repositories --repository-names ecommerce/backend-$region --region $region 2>/dev/null || \
+          aws ecr create-repository --repository-name ecommerce/backend-$region --region $region
+        done
+
+  build:
+    commands:
+      - echo "Build phase started on `date`"
+      
+      # Install application dependencies
+      - echo "Installing frontend dependencies..."
+      - cd application/frontend && npm install && cd ../..
+      
+      - echo "Installing backend dependencies..."
+      - cd application/backend && npm install && cd ../..
+      
+      # Build applications for each region
+      - |
+        for region in $REGIONS; do
+          echo "Building applications for region: $region"
+          
+          # Build Frontend
+          echo "Building frontend for $region..."
+          cd application/frontend
+          
+          # Set region-specific environment variables
+          export REACT_APP_REGION=$region
+          export REACT_APP_API_URL="https://api-$region.ecommerce.com"
+          
+          # Build the application
+          npm run build
+          
+          # Build Docker image
+          docker build -f ../../deployment/dockerfiles/frontend/Dockerfile.$region \
+            -t $AWS_ACCOUNT_ID.dkr.ecr.$region.amazonaws.com/ecommerce/frontend-$region:latest \
+            -t $AWS_ACCOUNT_ID.dkr.ecr.$region.amazonaws.com/ecommerce/frontend-$region:$CODEBUILD_BUILD_NUMBER .
+          
+          cd ../..
+          
+          # Build Backend
+          echo "Building backend for $region..."
+          cd application/backend
+          
+          # Set region-specific environment variables
+          export NODE_ENV=production
+          export REGION=$region
+          
+          # Build the application
+          npm run build
+          
+          # Build Docker image
+          docker build -f ../../deployment/dockerfiles/backend/Dockerfile.$region \
+            -t $AWS_ACCOUNT_ID.dkr.ecr.$region.amazonaws.com/ecommerce/backend-$region:latest \
+            -t $AWS_ACCOUNT_ID.dkr.ecr.$region.amazonaws.com/ecommerce/backend-$region:$CODEBUILD_BUILD_NUMBER .
+          
+          cd ../..
+        done
+
+  post_build:
+    commands:
+      - echo "Post-build phase started on `date`"
+      
+      # Push images to ECR
+      - |
+        for region in $REGIONS; do
+          echo "Pushing images to ECR for region: $region"
+          
+          # Push Frontend image
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$region.amazonaws.com/ecommerce/frontend-$region:latest
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$region.amazonaws.com/ecommerce/frontend-$region:$CODEBUILD_BUILD_NUMBER
+          
+          # Push Backend image
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$region.amazonaws.com/ecommerce/backend-$region:latest
+          docker push $AWS_ACCOUNT_ID.dkr.ecr.$region.amazonaws.com/ecommerce/backend-$region:$CODEBUILD_BUILD_NUMBER
+          
+          echo "Images pushed successfully for region: $region"
+        done
+      
+      - echo "Build completed successfully!"
+      - echo "Images built and pushed for regions: $REGIONS"
+
+artifacts:
+  files:
+    - deployment/scripts/**/*
+    - deployment/dockerfiles/**/*
+  name: BuildArtifacts

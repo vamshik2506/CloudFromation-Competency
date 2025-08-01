@@ -1,0 +1,52 @@
+# Backend Dockerfile for EU West 1 Region
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+RUN npm ci --only=production
+
+# Copy source code
+COPY . .
+
+# Build the application
+RUN npm run build
+
+# Production stage
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Install production dependencies
+COPY package*.json ./
+RUN npm ci --only=production && npm cache clean --force
+
+# Copy built application
+COPY --from=builder /app/dist ./dist
+
+# Set region-specific environment variables
+ENV NODE_ENV=production
+ENV REGION=eu-west-1
+ENV CURRENCY=EUR
+ENV TAX_RATE=0.20
+ENV OFFERS="vat_included,eu_flash_sale_20"
+ENV SHIPPING_COST=7.99
+ENV GDPR_COMPLIANCE=true
+ENV TIMEZONE=Europe/London
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs
+RUN adduser -S nodejs -u 1001
+
+# Change ownership of the app directory
+RUN chown -R nodejs:nodejs /app
+USER nodejs
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:3001/health || exit 1
+
+EXPOSE 3001
+
+CMD ["node", "dist/server.js"]

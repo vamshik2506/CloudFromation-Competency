@@ -1,0 +1,429 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda and Supporting Services for E-commerce Application'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  Region:
+    Type: String
+    Description: AWS Region for deployment
+  
+  ProjectName:
+    Type: String
+    Default: ecommerce
+    Description: Project name for resource naming
+  
+  VPCStackName:
+    Type: String
+    Description: Name of the VPC CloudFormation stack
+  
+  NotificationEmail:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: !Sub '/ecommerce/${AWS::Region}/sns/email'
+    Description: Email address for notifications
+
+Resources:
+  # S3 Bucket for Invoices
+  InvoicesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-invoices-${Region}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: ArchiveOldInvoices
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt InvoiceProcessorFunction.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-invoices-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Topic for Notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-notifications-${Region}'
+      DisplayName: E-commerce Notifications
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-notifications-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role-${Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${InvoicesBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Ref InvoicesBucket
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ecommerce/*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  # Lambda Function for Invoice Generation
+  InvoiceGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-invoice-generator-${Region}'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          REGION: !Ref Region
+          ENVIRONMENT: !Ref Environment
+          INVOICES_BUCKET: !Ref InvoicesBucket
+          NOTIFICATION_TOPIC: !Ref NotificationTopic
+          DB_HOST: !Sub '{{resolve:ssm:/ecommerce/${Region}/database/host}}'
+          DB_NAME: !Sub '{{resolve:ssm:/ecommerce/${Region}/database/name}}'
+          DB_USER: !Sub '{{resolve:ssm:/ecommerce/${Region}/database/username}}'
+          DB_PASSWORD: !Sub '{{resolve:ssm-secure:/ecommerce/${Region}/database/password}}'
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${VPCStackName}-LambdaSecurityGroup'
+        SubnetIds:
+          - Fn::Select:
+            - 0
+            - Fn::Split:
+              - ','
+              - Fn::ImportValue: !Sub '${VPCStackName}-PrivateSubnets'
+          - Fn::Select:
+            - 1
+            - Fn::Split:
+              - ','
+              - Fn::ImportValue: !Sub '${VPCStackName}-PrivateSubnets'
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const mysql = require('mysql2/promise');
+          const PDFDocument = require('pdfkit');
+          const { v4: uuidv4 } = require('uuid');
+          
+          const s3 = new AWS.S3();
+          const sns = new AWS.SNS();
+          
+          exports.handler = async (event) => {
+              console.log('Invoice generation triggered:', JSON.stringify(event, null, 2));
+              
+              try {
+                  const { orderId, orderData, customerInfo } = JSON.parse(event.body || event.Records?.[0]?.body || '{}');
+                  
+                  if (!orderId || !orderData) {
+                      throw new Error('Missing required order data');
+                  }
+                  
+                  // Generate invoice PDF
+                  const invoiceId = uuidv4();
+                  const pdfBuffer = await generateInvoicePDF(invoiceId, orderData, customerInfo);
+                  
+                  // Upload to S3
+                  const s3Key = `invoices/${new Date().getFullYear()}/${new Date().getMonth() + 1}/${invoiceId}.pdf`;
+                  await s3.putObject({
+                      Bucket: process.env.INVOICES_BUCKET,
+                      Key: s3Key,
+                      Body: pdfBuffer,
+                      ContentType: 'application/pdf',
+                      Metadata: {
+                          orderId: orderId,
+                          invoiceId: invoiceId,
+                          region: process.env.REGION
+                      }
+                  }).promise();
+                  
+                  // Store invoice record in database
+                  await storeInvoiceRecord(invoiceId, orderId, s3Key, orderData);
+                  
+                  // Send notification
+                  await sns.publish({
+                      TopicArn: process.env.NOTIFICATION_TOPIC,
+                      Subject: `Invoice Generated - ${invoiceId}`,
+                      Message: `Invoice ${invoiceId} has been generated for order ${orderId} in region ${process.env.REGION}.
+                      
+                      Customer: ${customerInfo?.name || 'N/A'}
+                      Email: ${customerInfo?.email || 'N/A'}
+                      Total Amount: $${orderData?.totalAmount || 0}
+                      
+                      Invoice stored at: s3://${process.env.INVOICES_BUCKET}/${s3Key}`
+                  }).promise();
+                  
+                  console.log(`Invoice ${invoiceId} generated successfully for order ${orderId}`);
+                  
+                  return {
+                      statusCode: 200,
+                      body: JSON.stringify({
+                          success: true,
+                          invoiceId: invoiceId,
+                          s3Key: s3Key,
+                          message: 'Invoice generated successfully'
+                      })
+                  };
+                  
+              } catch (error) {
+                  console.error('Error generating invoice:', error);
+                  
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify({
+                          success: false,
+                          error: error.message
+                      })
+                  };
+              }
+          };
+          
+          async function generateInvoicePDF(invoiceId, orderData, customerInfo) {
+              return new Promise((resolve, reject) => {
+                  const doc = new PDFDocument();
+                  const chunks = [];
+                  
+                  doc.on('data', chunk => chunks.push(chunk));
+                  doc.on('end', () => resolve(Buffer.concat(chunks)));
+                  doc.on('error', reject);
+                  
+                  // Header
+                  doc.fontSize(20).text('INVOICE', 50, 50);
+                  doc.fontSize(12).text(`Invoice #: ${invoiceId}`, 50, 80);
+                  doc.text(`Date: ${new Date().toLocaleDateString()}`, 50, 100);
+                  doc.text(`Region: ${process.env.REGION}`, 50, 120);
+                  
+                  // Customer Info
+                  doc.fontSize(14).text('Bill To:', 50, 160);
+                  if (customerInfo) {
+                      doc.fontSize(10)
+                         .text(customerInfo.name || 'N/A', 50, 180)
+                         .text(customerInfo.address || 'N/A', 50, 195)
+                         .text(`${customerInfo.city || 'N/A'}, ${customerInfo.zipCode || 'N/A'}`, 50, 210)
+                         .text(customerInfo.country || 'N/A', 50, 225)
+                         .text(customerInfo.email || 'N/A', 50, 240);
+                  }
+                  
+                  // Order Items
+                  doc.fontSize(12).text('Items:', 50, 280);
+                  let yPos = 300;
+                  
+                  if (orderData.items) {
+                      orderData.items.forEach(item => {
+                          doc.fontSize(10)
+                             .text(item.product?.name || 'Unknown Item', 50, yPos)
+                             .text(`${item.quantity}x`, 200, yPos)
+                             .text(`$${(item.product?.price || 0).toFixed(2)}`, 250, yPos)
+                             .text(`$${((item.quantity || 0) * (item.product?.price || 0)).toFixed(2)}`, 300, yPos);
+                          yPos += 20;
+                      });
+                  }
+                  
+                  // Total
+                  yPos += 20;
+                  doc.fontSize(12).text(`Total: $${(orderData.totalAmount || 0).toFixed(2)}`, 200, yPos);
+                  
+                  // Footer
+                  doc.fontSize(8).text('Thank you for your business!', 50, 700);
+                  
+                  doc.end();
+              });
+          }
+          
+          async function storeInvoiceRecord(invoiceId, orderId, s3Key, orderData) {
+              const connection = await mysql.createConnection({
+                  host: process.env.DB_HOST,
+                  user: process.env.DB_USER,
+                  password: process.env.DB_PASSWORD,
+                  database: process.env.DB_NAME
+              });
+              
+              try {
+                  await connection.execute(
+                      `INSERT INTO invoices (id, order_id, s3_key, amount, region, created_at) 
+                       VALUES (?, ?, ?, ?, ?, NOW())`,
+                      [invoiceId, orderId, s3Key, orderData.totalAmount || 0, process.env.REGION]
+                  );
+              } finally {
+                  await connection.end();
+              }
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-invoice-generator-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function for Invoice Processing (S3 trigger)
+  InvoiceProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-invoice-processor-${Region}'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          REGION: !Ref Region
+          ENVIRONMENT: !Ref Environment
+          NOTIFICATION_TOPIC: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const sns = new AWS.SNS();
+          
+          exports.handler = async (event) => {
+              console.log('S3 event received:', JSON.stringify(event, null, 2));
+              
+              try {
+                  for (const record of event.Records) {
+                      if (record.eventName.startsWith('ObjectCreated')) {
+                          const bucket = record.s3.bucket.name;
+                          const key = record.s3.object.key;
+                          
+                          console.log(`New invoice uploaded: s3://${bucket}/${key}`);
+                          
+                          // Send notification about successful upload
+                          await sns.publish({
+                              TopicArn: process.env.NOTIFICATION_TOPIC,
+                              Subject: 'Invoice Upload Confirmation',
+                              Message: `Invoice has been successfully uploaded to S3.
+                              
+                              Bucket: ${bucket}
+                              Key: ${key}
+                              Region: ${process.env.REGION}
+                              Timestamp: ${new Date().toISOString()}`
+                          }).promise();
+                      }
+                  }
+                  
+                  return {
+                      statusCode: 200,
+                      body: JSON.stringify({ message: 'Invoice processing completed' })
+                  };
+                  
+              } catch (error) {
+                  console.error('Error processing invoice:', error);
+                  throw error;
+              }
+          };
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-invoice-processor-${Region}'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Permission for S3 to invoke function
+  InvoiceProcessorS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InvoiceProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub '${InvoicesBucket}/*'
+
+  # CloudWatch Log Groups
+  InvoiceGeneratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${InvoiceGeneratorFunction}'
+      RetentionInDays: 30
+
+  InvoiceProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${InvoiceProcessorFunction}'
+      RetentionInDays: 30
+
+Outputs:
+  InvoicesBucket:
+    Description: S3 bucket for storing invoices
+    Value: !Ref InvoicesBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-InvoicesBucket'
+
+  NotificationTopic:
+    Description: SNS topic for notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  InvoiceGeneratorFunction:
+    Description: Lambda function for invoice generation
+    Value: !Ref InvoiceGeneratorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-InvoiceGeneratorFunction'
+
+  InvoiceProcessorFunction:
+    Description: Lambda function for invoice processing
+    Value: !Ref InvoiceProcessorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-InvoiceProcessorFunction'

@@ -1,0 +1,41 @@
+{
+  "github": {
+    "/ecommerce/github/owner": "your-github-username",
+    "/ecommerce/github/repo": "ecommerce-platform",
+    "/ecommerce/github/branch": "main",
+    "/ecommerce/github/token": "ghp_your_github_personal_access_token"
+  },
+  "deployment": {
+    "/ecommerce/deployment/regions": "us-east-1,eu-west-1,ap-south-1",
+    "/ecommerce/accounts/dev": "123456789012",
+    "/ecommerce/accounts/staging": "123456789013",
+    "/ecommerce/accounts/prod": "123456789014"
+  },
+  "us-east-1": {
+    "/ecommerce/us-east-1/vpc/cidr": "10.0.0.0/16",
+    "/ecommerce/us-east-1/database/name": "ecommerce_us",
+    "/ecommerce/us-east-1/database/username": "admin",
+    "/ecommerce/us-east-1/database/password": "SecurePassword123!",
+    "/ecommerce/us-east-1/sns/email": "alerts-us@yourcompany.com",
+    "/ecommerce/us-east-1/domain/name": "us.ecommerce.com",
+    "/ecommerce/us-east-1/alerts/email": "ops-us@yourcompany.com"
+  },
+  "eu-west-1": {
+    "/ecommerce/eu-west-1/vpc/cidr": "10.1.0.0/16",
+    "/ecommerce/eu-west-1/database/name": "ecommerce_eu",
+    "/ecommerce/eu-west-1/database/username": "admin",
+    "/ecommerce/eu-west-1/database/password": "SecurePassword123!",
+    "/ecommerce/eu-west-1/sns/email": "alerts-eu@yourcompany.com",
+    "/ecommerce/eu-west-1/domain/name": "eu.ecommerce.com",
+    "/ecommerce/eu-west-1/alerts/email": "ops-eu@yourcompany.com"
+  },
+  "ap-south-1": {
+    "/ecommerce/ap-south-1/vpc/cidr": "10.2.0.0/16",
+    "/ecommerce/ap-south-1/database/name": "ecommerce_apac",
+    "/ecommerce/ap-south-1/database/username": "admin",
+    "/ecommerce/ap-south-1/database/password": "SecurePassword123!",
+    "/ecommerce/ap-south-1/sns/email": "alerts-apac@yourcompany.com",
+    "/ecommerce/ap-south-1/domain/name": "apac.ecommerce.com",
+    "/ecommerce/ap-south-1/alerts/email": "ops-apac@yourcompany.com"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "ecommerce-lambda-functions",
+  "version": "1.0.0",
+  "description": "Lambda functions for E-commerce platform",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest",
+    "build": "zip -r function.zip ."
+  },
+  "dependencies": {
+    "aws-sdk": "^2.1509.0",
+    "mysql2": "^3.6.5",
+    "pdfkit": "^0.13.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}
